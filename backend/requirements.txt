@@ -1,0 +1,5 @@
+cffi==1.17.1
+mss==10.0.0
+pycparser==2.22
+python-dotenv==1.1.0
+sounddevice==0.5.1
