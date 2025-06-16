@@ -165,6 +165,12 @@ There are two ways to run the front-end: in development mode, or as a bundled Ta
    The `--reload` flag enables auto-reloading for code changes.  
 2. The FastAPI server will be available at [http://localhost:5001](http://localhost:5001).
 
+## UI Previews
+- **Home Page:**
+<p align="center">
+  <img width="1214" alt="image" src="https://github.com/user-attachments/assets/bb98f495-c03b-4255-af5e-f16ff1587e22" />
+</p>
+
 ## Troubleshooting
 - **Node/Tauri Issues:**  
   - Ensure Node.js and npm are up to date.  
