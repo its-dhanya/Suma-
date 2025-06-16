@@ -56,7 +56,7 @@ Suma leverages state-of-the-art AI to convert spoken content into detailed trans
 - **PDF Export**: Easily export your summaries into professional, styled PDF documents.
 - **User-Friendly Interface**: Seamlessly navigate through Home, Video, Transcript, and Summary tabs to manage your content.
 <p align="center">
-<img width="544" alt="image" src="https://github.com/user-attachments/assets/ebe3da29-040b-432b-bcda-430fb718df8e" />
+<img width="1280" alt="image" src="https://github.com/user-attachments/assets/fce23e0d-14f2-4f82-8cb7-f0eb3f63a984" />
 
 </p>
 
