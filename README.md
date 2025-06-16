@@ -55,6 +55,11 @@ Suma leverages state-of-the-art AI to convert spoken content into detailed trans
 - **Smart Summarization**: Generate comprehensive summaries that include overviews, core concepts, detailed explanations, examples, key takeaways, and revision questions.
 - **PDF Export**: Easily export your summaries into professional, styled PDF documents.
 - **User-Friendly Interface**: Seamlessly navigate through Home, Video, Transcript, and Summary tabs to manage your content.
+<p align="center">
+<img width="544" alt="image" src="https://github.com/user-attachments/assets/ebe3da29-040b-432b-bcda-430fb718df8e" />
+
+</p>
+
 
 ## Repository Information
 This repository is actively maintained on GitHub:
