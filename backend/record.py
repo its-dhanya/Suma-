@@ -1,22 +1,39 @@
+"""
+record.py — Audio recording + visual capture module.
+
+Supports two capture modes (set via ENV or at runtime):
+  - "esp32"  : Pull JPEG frames from an ESP32-CAM HTTP stream (production)
+  - "screen" : Grab the primary monitor with mss (fallback / dev mode)
+
+Set CAPTURE_MODE=esp32  and  ESP32_CAM_URL=http://<IP>/capture  in your .env
+to use the real hardware. Leave CAPTURE_MODE=screen for local dev / testing.
+"""
+
 import os
+import io
 import time
 import threading
 import logging
 import wave
-from datetime import datetime
-from dotenv import load_dotenv
-import sounddevice as sd
-import numpy as np
-import mss
 import signal
+from datetime import datetime
 
-# Load environment variables
+import numpy as np
+import sounddevice as sd
+from dotenv import load_dotenv
+
 load_dotenv()
-SCREENSHOT_INTERVAL = int(os.getenv("SCREENSHOT_INTERVAL", 5))
-AUDIO_DURATION = int(os.getenv("DEFAULT_AUDIO_DURATION", 10))  # seconds
-OUTPUT_ROOT = os.path.abspath(os.getenv("OUTPUT_DIR", "../sessions"))
 
-# Logging setup
+# ── Configuration ──────────────────────────────────────────────────────────────
+SCREENSHOT_INTERVAL = int(os.getenv("SCREENSHOT_INTERVAL", 5))
+CAPTURE_MODE        = os.getenv("CAPTURE_MODE", "screen").lower()   # "esp32" | "screen"
+ESP32_CAM_URL       = os.getenv("ESP32_CAM_URL", "http://192.168.4.1/capture")
+ESP32_STREAM_URL    = os.getenv("ESP32_STREAM_URL", "http://192.168.4.1:81/stream")
+ESP32_TIMEOUT       = int(os.getenv("ESP32_TIMEOUT", 5))            # seconds per frame request
+
+AUDIO_FS = 44100
+
+# ── Logging ────────────────────────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.getcwd(), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
@@ -25,116 +42,179 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-AUDIO_FS = 44100  # Sample rate
-
-# Global flag for graceful termination
+# ── Shared stop flag ───────────────────────────────────────────────────────────
 stop_flag = threading.Event()
 
+
 def signal_handler(sig, frame):
-    logging.info("🔴 Termination signal received. Stopping...")
+    logging.info("Termination signal received — stopping session")
     stop_flag.set()
+
 
 signal.signal(signal.SIGINT, signal_handler)
 
-def record_audio(output_file, duration=AUDIO_DURATION, samplerate=AUDIO_FS):
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUDIO RECORDING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def record_audio(output_file: str, samplerate: int = AUDIO_FS) -> None:
+    """
+    Record from the default microphone (or INMP441 via I2S bridge) until
+    stop_flag is set, then write a WAV file.
+    """
+    logging.info(f"Audio recording started → {output_file}")
+    channels = 1
+    frames   = []
+
     try:
-        input_device = sd.default.device[0]
-        device_info = sd.query_devices(input_device, 'input')
-        channels = device_info.get('max_input_channels', 1)
-        if channels < 1 or channels > 2:
-            logging.warning(f"Invalid number of input channels ({channels}); falling back to mono.")
-            channels = 1
-
-        logging.info(f"Recording audio with {channels} channel(s) from: {device_info.get('name', 'Unknown device')}")
-        
-        total_frames = int(duration * samplerate)
-        audio = np.zeros((total_frames, channels), dtype='int16')
-        stream = sd.InputStream(samplerate=samplerate, channels=channels, dtype='int16')
-
-        with stream:
-            recorded_frames = 0
-            start_time = time.time()
-            while time.time() - start_time < duration:
-                if stop_flag.is_set():
-                    logging.info("Stop flag detected during audio recording.")
-                    break
-                buffer, overflow = stream.read(samplerate // 5)
+        with sd.InputStream(samplerate=samplerate, channels=channels, dtype="int16") as stream:
+            while not stop_flag.is_set():
+                data, overflow = stream.read(samplerate // 5)
                 if overflow:
-                    logging.warning("Buffer overflow occurred during recording.")
-                frames = len(buffer)
-                end_frame = recorded_frames + frames
-                if end_frame > total_frames:
-                    end_frame = total_frames
-                    frames = total_frames - recorded_frames
-                audio[recorded_frames:end_frame] = buffer[:frames]
-                recorded_frames += frames
-            logging.info(f"Recorded {recorded_frames} frames out of {total_frames}")
-            
-        audio = audio[:recorded_frames]
-        with wave.open(output_file, 'w') as wf:
+                    logging.warning("Audio buffer overflow")
+                frames.append(data.copy())
+
+        if not frames:
+            logging.error("No audio frames captured")
+            return
+
+        audio = np.concatenate(frames, axis=0)
+        with wave.open(output_file, "wb") as wf:
             wf.setnchannels(channels)
             wf.setsampwidth(2)
             wf.setframerate(samplerate)
             wf.writeframes(audio.tobytes())
-        logging.info(f"✅ Audio recording complete. Saved to: {output_file}")
-        print(f"Audio saved to: {output_file}")
-        if not os.path.exists(output_file):
-            logging.error(f"Audio file was not created: {output_file}")
-        else:
-            logging.info(f"Audio file exists: {os.path.abspath(output_file)}")
-    except Exception as e:
-        logging.error(f"❌ Audio recording error: {e}", exc_info=True)
 
-def capture_screen(session_dir):
+        logging.info(f"Audio saved: {output_file} ({len(frames)} chunks)")
+
+    except Exception:
+        logging.exception("Audio recording failed")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ESP32-CAM CAPTURE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _save_jpeg_bytes(jpeg_bytes: bytes, path: str) -> None:
+    """Write raw JPEG bytes to disk."""
+    with open(path, "wb") as f:
+        f.write(jpeg_bytes)
+
+
+def _fetch_esp32_still(session_dir: str) -> None:
+    """
+    Poll the ESP32-CAM /capture endpoint once per SCREENSHOT_INTERVAL seconds.
+    Each response is a JPEG; we save it as a PNG-named file for pipeline
+    compatibility (Pillow / OpenCV open either format transparently).
+    """
+    import requests  # lazy import — only needed in esp32 mode
+
+    count = 0
+    logging.info(f"ESP32-CAM still-capture started (URL: {ESP32_CAM_URL})")
+
+    while not stop_flag.is_set():
+        try:
+            resp = requests.get(ESP32_CAM_URL, timeout=ESP32_TIMEOUT, stream=False)
+            resp.raise_for_status()
+
+            filename = os.path.join(session_dir, f"screenshot_{count:03}.png")
+            _save_jpeg_bytes(resp.content, filename)
+            logging.info(f"ESP32 frame saved: {filename}")
+            count += 1
+
+        except Exception as e:
+            logging.warning(f"ESP32 frame fetch failed: {e}")
+
+        time.sleep(SCREENSHOT_INTERVAL)
+
+    logging.info("ESP32-CAM still-capture stopped")
+
+
+def _fetch_esp32_stream(session_dir: str) -> None:
+    """
+    Read from the ESP32-CAM MJPEG stream endpoint (:81/stream).
+    Parses multipart/x-mixed-replace boundaries to extract individual JPEGs.
+    Falls back to the still-capture method on error.
+    """
+    import requests
+
+    count = 0
+    logging.info(f"ESP32-CAM MJPEG stream started (URL: {ESP32_STREAM_URL})")
+    last_saved = time.time()
+
     try:
-        logging.info("Starting screenshot capture...")
-        with mss.mss() as sct:
-            count = 0
-            start_time = time.time()
-            while time.time() - start_time < AUDIO_DURATION:
+        with requests.get(ESP32_STREAM_URL, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            buffer = b""
+            for chunk in resp.iter_content(chunk_size=4096):
                 if stop_flag.is_set():
-                    logging.info("Stop flag detected during screen capture.")
                     break
-                filename = os.path.join(session_dir, f"screenshot_{count:03}.png")
-                # Capture and save the screenshot
-                sct.shot(output=filename)
-                logging.info(f"📸 Saved screenshot: {filename}")
-                print(f"Screenshot saved: {filename}")
-                time.sleep(SCREENSHOT_INTERVAL)
-                count += 1
-        logging.info("✅ Screen capture complete.")
-    except Exception as e:
-        logging.error(f"❌ Screen capture error: {e}", exc_info=True)
+                buffer += chunk
+                # JPEG SOI/EOI markers
+                start = buffer.find(b"\xff\xd8")
+                end   = buffer.find(b"\xff\xd9")
+                if start != -1 and end != -1 and end > start:
+                    jpeg_bytes = buffer[start: end + 2]
+                    buffer = buffer[end + 2:]
+                    now = time.time()
+                    if now - last_saved >= SCREENSHOT_INTERVAL:
+                        filename = os.path.join(session_dir, f"screenshot_{count:03}.png")
+                        _save_jpeg_bytes(jpeg_bytes, filename)
+                        logging.info(f"MJPEG frame saved: {filename}")
+                        count += 1
+                        last_saved = now
 
-def main():
-    logging.info("🚀 Session started")
-    print("Session started")
-    
-    # Create a new session directory for this recording session
-    timestamp = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-    session_dir = os.path.join(OUTPUT_ROOT, timestamp)
+    except Exception as e:
+        logging.warning(f"MJPEG stream failed ({e}), falling back to still capture")
+        _fetch_esp32_still(session_dir)
+
+    logging.info("ESP32-CAM MJPEG stream stopped")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCREEN CAPTURE (fallback / dev mode)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _capture_screen(session_dir: str) -> None:
+    """Capture the primary monitor with mss every SCREENSHOT_INTERVAL seconds."""
+    import mss
+    import mss.tools
+
+    logging.info("Screen-capture mode started")
+    count = 0
+
     try:
-        os.makedirs(session_dir, exist_ok=True)
-        logging.info(f"Session directory created at: {session_dir}")
-        print(f"Session directory created at: {session_dir}")
-    except Exception as e:
-        logging.error(f"Failed to create session directory: {e}")
-        return  # Abort if session directory cannot be created
-    
-    # Create the audio file path inside the session directory
-    audio_file = os.path.join(session_dir, "audio.wav")
-    
-    audio_thread = threading.Thread(target=record_audio, args=(audio_file,), name="AudioThread")
-    screen_thread = threading.Thread(target=capture_screen, args=(session_dir,), name="ScreenThread")
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            while not stop_flag.is_set():
+                filename = os.path.join(session_dir, f"screenshot_{count:03}.png")
+                img = sct.grab(monitor)
+                mss.tools.to_png(img.rgb, img.size, output=filename)
+                logging.info(f"Screenshot saved: {filename}")
+                count += 1
+                time.sleep(SCREENSHOT_INTERVAL)
+    except Exception:
+        logging.exception("Screen capture failed")
 
-    audio_thread.start()
-    screen_thread.start()
 
-    audio_thread.join()
-    screen_thread.join()
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLIC INTERFACE
+# ══════════════════════════════════════════════════════════════════════════════
 
-    logging.info("✅ Session finished")
-    print("✔️ Session complete. Files saved to:", session_dir)
+def capture_screen(session_dir: str) -> None:
+    """
+    Entry point for the capture thread.
+    Routes to ESP32-CAM (MJPEG stream or still poll) or screen capture
+    based on the CAPTURE_MODE environment variable.
+    """
+    if CAPTURE_MODE == "esp32":
+        # Prefer MJPEG streaming; _fetch_esp32_stream falls back to still if needed
+        _fetch_esp32_stream(session_dir)
+    else:
+        _capture_screen(session_dir)
 
-if __name__ == '__main__':
-    main()
+
+def get_capture_mode() -> str:
+    """Return the active capture mode string for status reporting."""
+    return CAPTURE_MODE

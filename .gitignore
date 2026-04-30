@@ -1,0 +1,31 @@
+# Mac
+.DS_Store
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Logs & temp
+logs/
+sessions/
+
+# Node
+node_modules/
+
+# Archives
+*.zip
+
+# Build / misc
+dist/
+build/
+
+# Requirements (optional)
+requirements_full.txt
+
+# Tauri
+src-tauri/target/
+
+# Other
+backend/.DS_Store
+frontend/.DS_Store
