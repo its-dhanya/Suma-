@@ -1,0 +1,12 @@
+cffi==1.17.1
+pycparser==2.22
+python-dotenv==1.1.0
+sounddevice==0.5.1
+fastapi==0.135.1
+uvicorn==0.41.0
+pytesseract
+easyocr
+opencv-python
+openai-whisper==20250625
+requests==2.32.5
+mss
